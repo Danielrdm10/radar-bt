@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radar Arduino</title>
+<style>
+  :root { --verde:#39ff6a; --verde-escuro:#0b2a14; --fundo:#030a05; --alerta:#ff5a4d; }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; min-height:100vh; background:var(--fundo); color:var(--verde);
+    font-family: "Consolas","Courier New",monospace; display:flex; flex-direction:column; align-items:center;
+    padding:16px;
+  }
+  h1 { margin:4px 0 12px; font-size:1.4rem; letter-spacing:.2em; text-transform:uppercase; }
+  .painel { width:100%; max-width:900px; }
+  .barra { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+  button, select {
+    background:var(--verde-escuro); color:var(--verde); border:1px solid var(--verde);
+    padding:8px 14px; font-family:inherit; font-size:.95rem; border-radius:6px; cursor:pointer;
+  }
+  button:hover { background:#124a22; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  #status { margin-left:auto; font-size:.9rem; }
+  #status.ok { color:var(--verde); }
+  #status.err { color:var(--alerta); }
+  .radar-caixa { border:1px solid #145a2a; border-radius:10px; padding:8px; background:#020703; }
+  canvas { display:block; width:100%; }
+  .leituras { display:flex; gap:12px; margin-top:12px; flex-wrap:wrap; }
+  .leitura { flex:1; min-width:120px; border:1px solid #145a2a; border-radius:8px; padding:10px; background:#020703; }
+  .leitura small { display:block; opacity:.7; margin-bottom:4px; }
+  .leitura span { font-size:1.6rem; }
+</style>
+</head>
+<body>
+  <h1>Radar</h1>
+  <div class="painel">
+    <div class="barra">
+      <select id="dispositivo" style="display:none"></select>
+      <button id="btnConectar">Conectar ao Arduino</button>
+      <button id="btnDesconectar" disabled>Desconectar</button>
+      <label>Alcance
+        <select id="alcance">
+          <option value="500" selected>5 m</option>
+          <option value="1000">10 m</option>
+          <option value="5000">50 m</option>
+          <option value="10000">100 m</option>
+        </select>
+      </label>
+      <div id="status">Desconectado</div>
+    </div>
+
+    <div class="radar-caixa"><canvas id="radar"></canvas></div>
+
+    <div class="leituras">
+      <div class="leitura"><small>ÂNGULO</small><span id="lAngulo">--</span></div>
+      <div class="leitura"><small>DISTÂNCIA</small><span id="lDistancia">--</span></div>
+      <div class="leitura"><small>OBJETOS NA TELA</small><span id="lObjetos">0</span></div>
+    </div>
+  </div>
+
+<script>
+(function () {
+  var canvas = document.getElementById('radar');
+  var ctx = canvas.getContext('2d');
+  var elStatus = document.getElementById('status');
+  var btnConectar = document.getElementById('btnConectar');
+  var btnDesconectar = document.getElementById('btnDesconectar');
+  var selAlcance = document.getElementById('alcance');
+  var lAngulo = document.getElementById('lAngulo');
+  var lDistancia = document.getElementById('lDistancia');
+  var lObjetos = document.getElementById('lObjetos');
+
+  var alcanceMax = 500;          // cm no raio externo do radar
+  var TEMPO_BLIP = 4000;         // ms que um objeto detectado demora para apagar
+  var hits = [];                 // objetos detectados {a, d, t}
+  var trilha = [];               // ângulos recentes do feixe {a, t}
+  var anguloAtual = null;
+  var distanciaAtual = null;
+
+  var porta = null;
+  var leitor = null;
+  var lendo = false;
+
+  function setStatus(texto, classe) {
+    elStatus.textContent = texto;
+    elStatus.className = classe || '';
+  }
+
+  function ajustarTamanho() {
+    var larg = canvas.parentElement.clientWidth - 16;
+    var alt = Math.round(larg / 2 + 50);
+    var dpr = window.devicePixelRatio || 1;
+    canvas.style.width = larg + 'px';
+    canvas.style.height = alt + 'px';
+    canvas.width = Math.round(larg * dpr);
+    canvas.height = Math.round(alt * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // Escreve a distância em cm ou em metros (a partir de 100 cm)
+  function formatarDistancia(cm) {
+    if (cm >= 100) {
+      return (Math.round(cm / 10) / 10).toString().replace('.', ',') + ' m';
+    }
+    return Math.round(cm) + ' cm';
+  }
+
+  // Recebe uma linha do Arduino no formato "90,25"
+  function processarLinha(linha) {
+    var m = linha.trim().match(/^(\d{1,3})\s*,\s*(\d+)$/);
+    if (!m) return;
+    var a = parseInt(m[1], 10);
+    var d = parseInt(m[2], 10);
+    if (a < 0 || a > 180) return;
+    var agora = performance.now();
+    anguloAtual = a;
+    distanciaAtual = d;
+    trilha.push({ a: a, t: agora });
+    if (trilha.length > 80) trilha.shift();
+    // distância 0 = sem eco; acima do alcance = fora da tela
+    if (d > 0 && d <= alcanceMax) {
+      hits.push({ a: a, d: d, t: agora });
+      if (hits.length > 800) hits.shift();
+    }
+  }
+
+  function desenhar() {
+    var W = canvas.clientWidth;
+    var H = canvas.clientHeight;
+    var agora = performance.now();
+    var cx = W / 2;
+    var cy = H - 24;
+    var R = Math.min(W / 2 - 24, H - 48);
+
+    ctx.clearRect(0, 0, W, H);
+
+    // anéis de distância
+    ctx.lineWidth = 1;
+    ctx.font = '12px Consolas, monospace';
+    ctx.fillStyle = 'rgba(57,255,106,0.7)';
+    for (var i = 1; i <= 4; i++) {
+      var r = R * i / 4;
+      ctx.strokeStyle = 'rgba(57,255,106,0.35)';
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI);
+      ctx.stroke();
+      ctx.fillText(formatarDistancia(alcanceMax * i / 4), cx + 4, cy - r + 14);
+    }
+
+    // linhas de ângulo a cada 30 graus
+    for (var g = 0; g <= 180; g += 30) {
+      var rad = g * Math.PI / 180;
+      var x = cx + R * Math.cos(rad);
+      var y = cy - R * Math.sin(rad);
+      ctx.strokeStyle = 'rgba(57,255,106,0.25)';
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(57,255,106,0.8)';
+      var tx = cx + (R + 14) * Math.cos(rad) - 10;
+      var ty = cy - (R + 14) * Math.sin(rad) + 4;
+      ctx.fillText(g + '°', tx, ty);
+    }
+
+    // linha de base
+    ctx.strokeStyle = 'rgba(57,255,106,0.5)';
+    ctx.beginPath();
+    ctx.moveTo(cx - R, cy);
+    ctx.lineTo(cx + R, cy);
+    ctx.stroke();
+
+    // rastro do feixe (apaga em 0,7 s)
+    ctx.lineWidth = 3;
+    for (var k = 0; k < trilha.length; k++) {
+      var idade = agora - trilha[k].t;
+      if (idade > 700) continue;
+      var alfa = (1 - idade / 700) * 0.35;
+      var rd = trilha[k].a * Math.PI / 180;
+      ctx.strokeStyle = 'rgba(57,255,106,' + alfa.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + R * Math.cos(rd), cy - R * Math.sin(rd));
+      ctx.stroke();
+    }
+
+    // feixe atual
+    if (anguloAtual !== null) {
+      var rb = anguloAtual * Math.PI / 180;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#39ff6a';
+      ctx.shadowColor = '#39ff6a';
+      ctx.shadowBlur = 12;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + R * Math.cos(rb), cy - R * Math.sin(rb));
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+
+    // objetos detectados (apagam aos poucos)
+    hits = hits.filter(function (h) { return agora - h.t < TEMPO_BLIP; });
+    for (var n = 0; n < hits.length; n++) {
+      var h = hits[n];
+      var alfaH = 1 - (agora - h.t) / TEMPO_BLIP;
+      var rr = R * h.d / alcanceMax;
+      var ra = h.a * Math.PI / 180;
+      var px = cx + rr * Math.cos(ra);
+      var py = cy - rr * Math.sin(ra);
+      ctx.fillStyle = 'rgba(255,90,77,' + alfaH.toFixed(3) + ')';
+      ctx.shadowColor = '#ff5a4d';
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.arc(px, py, 5, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+
+    // leituras
+    lAngulo.textContent = anguloAtual === null ? '--' : anguloAtual + '°';
+    if (distanciaAtual === null) lDistancia.textContent = '--';
+    else if (distanciaAtual === 0) lDistancia.textContent = 'sem eco';
+    else lDistancia.textContent = distanciaAtual + ' cm';
+    lObjetos.textContent = hits.length;
+
+    requestAnimationFrame(desenhar);
+  }
+
+  // ---------- Conexão pelo app Android (Bluetooth Clássico) ----------
+  var noApp = typeof window.AndroidBT !== 'undefined';
+  var selDisp = document.getElementById('dispositivo');
+
+  // Preenche a lista com os aparelhos já pareados no celular
+  window.carregarPareados = function () {
+    if (!noApp) return;
+    var lista = [];
+    try { lista = JSON.parse(window.AndroidBT.pareados()); } catch (e) {}
+    selDisp.innerHTML = '';
+    lista.forEach(function (d) {
+      var op = document.createElement('option');
+      op.value = d.endereco;
+      op.textContent = d.nome;
+      if (/HC-0[56]/i.test(d.nome)) op.selected = true;
+      selDisp.appendChild(op);
+    });
+    if (!lista.length) setStatus('Nenhum aparelho pareado', 'err');
+  };
+
+  // Funções chamadas pelo app Android
+  window.radarLinha = function (linha) { processarLinha(linha); };
+  window.radarConectado = function () {
+    btnConectar.disabled = true;
+    btnDesconectar.disabled = false;
+    setStatus('Conectado', 'ok');
+  };
+  window.radarErro = function (msg) {
+    btnConectar.disabled = false;
+    btnDesconectar.disabled = true;
+    setStatus(msg, 'err');
+  };
+
+  if (noApp) {
+    selDisp.style.display = '';
+    window.carregarPareados();
+  }
+
+  // ---------- Conexão com o Arduino (Web Serial, no PC) ----------
+  async function conectar() {
+    if (noApp) {
+      if (!selDisp.value) { window.carregarPareados(); return; }
+      btnConectar.disabled = true;
+      setStatus('Conectando...');
+      window.AndroidBT.conectar(selDisp.value);
+      return;
+    }
+    if (!('serial' in navigator)) {
+      setStatus('Use o Chrome ou o Edge no computador', 'err');
+      return;
+    }
+    try {
+      porta = await navigator.serial.requestPort();
+      await porta.open({ baudRate: 9600 });
+      lendo = true;
+      btnConectar.disabled = true;
+      btnDesconectar.disabled = false;
+      setStatus('Conectado', 'ok');
+      lerPorta();
+    } catch (e) {
+      setStatus('Erro: ' + e.message, 'err');
+      porta = null;
+    }
+  }
+
+  async function lerPorta() {
+    var decoder = new TextDecoder();
+    var buffer = '';
+    while (porta && porta.readable && lendo) {
+      leitor = porta.readable.getReader();
+      try {
+        while (true) {
+          var r = await leitor.read();
+          if (r.done) break;
+          buffer += decoder.decode(r.value, { stream: true });
+          var idx;
+          while ((idx = buffer.indexOf('\n')) >= 0) {
+            processarLinha(buffer.slice(0, idx));
+            buffer = buffer.slice(idx + 1);
+          }
+        }
+      } catch (e) {
+        setStatus('Leitura interrompida: ' + e.message, 'err');
+        lendo = false;
+      } finally {
+        leitor.releaseLock();
+      }
+    }
+  }
+
+  async function desconectar() {
+    if (noApp) {
+      window.AndroidBT.desconectar();
+      btnConectar.disabled = false;
+      btnDesconectar.disabled = true;
+      setStatus('Desconectado');
+      return;
+    }
+    lendo = false;
+    try { if (leitor) await leitor.cancel(); } catch (e) {}
+    await new Promise(function (ok) { setTimeout(ok, 150); });
+    try { if (porta) await porta.close(); } catch (e) {}
+    porta = null;
+    btnConectar.disabled = false;
+    btnDesconectar.disabled = true;
+    setStatus('Desconectado');
+  }
+
+  btnConectar.addEventListener('click', conectar);
+  btnDesconectar.addEventListener('click', desconectar);
+  selAlcance.addEventListener('change', function () {
+    alcanceMax = parseInt(selAlcance.value, 10);
+    hits = [];
+  });
+  window.addEventListener('resize', ajustarTamanho);
+
+  ajustarTamanho();
+  requestAnimationFrame(desenhar);
+})();
+</script>
+</body>
+</html>
